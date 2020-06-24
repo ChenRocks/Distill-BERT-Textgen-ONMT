@@ -302,3 +302,57 @@ def shards(state, shard_size, eval_only=False):
                                      [v_chunk.grad for v_chunk in v_split]))
         inputs, grads = zip(*variables)
         torch.autograd.backward(inputs, grads)
+
+
+def kd_loss(log_prob, teacher_outputs, temperature, mask, top_k):
+    """ our own temp scaling """
+    # NOTE: the temperature scaling is kind of non-standard, as we observe
+    #       better empirical performance this way
+    T = temperature
+    topk_prob, topk_idx = teacher_outputs
+    topk_prob = F.softmax(topk_prob/T, dim=-1)
+    loss = -(log_prob.gather(dim=-1, index=topk_idx) * topk_prob)[mask].sum()
+    return loss
+
+
+class BertKDLossCompute(LossComputeBase):
+    """
+    Standard NMT Loss Computation with BERT Knowledge Distillation
+    """
+    def __init__(self, generator, padding_idx, lsr=0.1, top_k=8):
+        super().__init__(kd_loss, generator)
+        self.pad = padding_idx
+        self.lsr = lsr
+        self.top_k = top_k
+
+    @property
+    def padding_idx(self):
+        return self.pad
+
+    def __call__(self, outputs, bert_logits, target, normalization,
+                 temperature, alpha):
+        scores = self._bottle(self.generator(outputs))
+        target = target.view(-1)
+        non_pad = target != self.padding_idx
+        log_prob = F.log_softmax(scores, dim=-1)
+        loss_xe = F.nll_loss(log_prob, target, reduction='sum',
+                             ignore_index=self.padding_idx)
+        if self.lsr > 0:
+            vsize = scores.size(-1)
+            true_weight = 1-self.lsr
+            smooth_weight = self.lsr/(vsize-2)
+            smooth_loss = -log_prob.sum(dim=-1, keepdim=False)
+            loss_xe = (loss_xe * true_weight
+                       + smooth_loss[non_pad].sum() * smooth_weight)
+        if alpha > 0:
+            if isinstance(bert_logits, tuple):
+                bert_logits = tuple(map(self._bottle, bert_logits))
+            else:
+                bert_logits = self._bottle(bert_logits)
+            loss_kd = kd_loss(log_prob, bert_logits,
+                              temperature, non_pad, self.top_k)
+            loss = loss_xe * (1. - alpha) + loss_kd * alpha
+        else:
+            loss = loss_xe
+        stats = self._stats(loss.clone(), log_prob, target)
+        return loss/normalization, stats

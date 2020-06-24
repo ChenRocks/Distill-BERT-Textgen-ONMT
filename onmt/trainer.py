@@ -17,6 +17,15 @@ import onmt.utils
 from onmt.utils.logging import logger
 
 
+class GeneratorWrapper(object):
+    def __init__(self, proj):
+        self.proj = proj
+
+    def __call__(self, input_):
+        output = self.proj(input_).float()
+        return output
+
+
 def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
     """
     Simplify `Trainer` creation based on user `opt`s*
@@ -31,9 +40,17 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         model_saver(:obj:`onmt.models.ModelSaverBase`): the utility object
             used to save the model
     """
-
     tgt_field = dict(fields)["tgt"].base_field
-    train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
+    if opt.bert_kd:
+        padding_idx = tgt_field.vocab.stoi[tgt_field.pad_token]
+        # remove log_softmax in generator
+        generator = GeneratorWrapper(model.generator[0])
+        train_loss = onmt.utils.loss.BertKDLossCompute(generator,
+                                                       padding_idx,
+                                                       opt.label_smoothing,
+                                                       opt.kd_topk)
+    else:
+        train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
     valid_loss = onmt.utils.loss.build_loss_compute(
         model, tgt_field, opt, train=False)
 
@@ -44,22 +61,39 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
     n_gpu = opt.world_size
     average_decay = opt.average_decay
     average_every = opt.average_every
-    if device_id >= 0:
-        gpu_rank = opt.gpu_ranks[device_id]
+    if opt.local_rank == -1:
+        if device_id >= 0:
+            gpu_rank = opt.gpu_ranks[device_id]
+        else:
+            gpu_rank = 0
+            n_gpu = 0
     else:
-        gpu_rank = 0
-        n_gpu = 0
+        gpu_rank = opt.local_rank
+        n_gpu = torch.distributed.get_world_size()
     gpu_verbose_level = opt.gpu_verbose_level
 
-    report_manager = onmt.utils.build_report_manager(opt)
-    trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
-                           shard_size, norm_method,
-                           grad_accum_count, n_gpu, gpu_rank,
-                           gpu_verbose_level, report_manager,
-                           model_saver=model_saver if gpu_rank == 0 else None,
-                           average_decay=average_decay,
-                           average_every=average_every,
-                           model_dtype=opt.model_dtype)
+    report_manager = onmt.utils.build_report_manager(opt, gpu_rank)
+    if opt.bert_kd:
+        trainer = BertKDTrainer(opt.kd_alpha, opt.kd_temperature,
+                                model, train_loss, valid_loss, optim,
+                                trunc_size, shard_size, norm_method,
+                                grad_accum_count, n_gpu, gpu_rank,
+                                gpu_verbose_level, report_manager,
+                                model_saver=(model_saver if gpu_rank == 0
+                                             else None),
+                                average_decay=average_decay,
+                                average_every=average_every,
+                                model_dtype=opt.model_dtype)
+    else:
+        trainer = onmt.Trainer(model, train_loss, valid_loss, optim,
+                               trunc_size, shard_size, norm_method,
+                               grad_accum_count, n_gpu, gpu_rank,
+                               gpu_verbose_level, report_manager,
+                               model_saver=(model_saver if gpu_rank == 0
+                                            else None),
+                               average_decay=average_decay,
+                               average_every=average_every,
+                               model_dtype=opt.model_dtype)
     return trainer
 
 
@@ -192,6 +226,12 @@ class Trainer(object):
                 self._accum_batches(train_iter)):
             step = self.optim.training_step
 
+            if step % (100//self.grad_accum_count) == 0:
+                torch.cuda.empty_cache()
+
+            self.report_manager.progress_step = (
+                step // self.report_manager.report_every)
+
             if self.gpu_verbose_level > 1:
                 logger.info("GpuRank %d: index: %d", self.gpu_rank, i)
             if self.gpu_verbose_level > 0:
@@ -294,6 +334,8 @@ class Trainer(object):
 
         for batch in true_batches:
             target_size = batch.tgt.size(0)
+            if self.model_dtype == 'fp16' and 'src_map' in batch.__dict__:
+                batch.src_map = batch.src_map.half()
             # Truncated BPTT: reminder not compatible with accum > 1
             if self.trunc_size:
                 trunc_size = self.trunc_size
@@ -409,3 +451,121 @@ class Trainer(object):
             return self.report_manager.report_step(
                 learning_rate, step, train_stats=train_stats,
                 valid_stats=valid_stats)
+
+
+class BertKDTrainer(Trainer):
+    """
+    Class that controls the training process.
+
+    Args:
+            model(:py:class:`onmt.models.model.NMTModel`): translation model
+                to train
+            train_loss(:obj:`onmt.utils.loss.LossComputeBase`):
+               training loss computation
+            valid_loss(:obj:`onmt.utils.loss.LossComputeBase`):
+               training loss computation
+            optim(:obj:`onmt.utils.optimizers.Optimizer`):
+               the optimizer responsible for update
+            trunc_size(int): length of truncated back propagation through time
+            shard_size(int): compute loss in shards of this size for efficiency
+            data_type(string): type of the source input: [text|img|audio]
+            norm_method(string): normalization methods: [sents|tokens]
+            grad_accum_count(int): accumulate gradients this many times.
+            report_manager(:obj:`onmt.utils.ReportMgrBase`):
+                the object that creates reports, or None
+            model_saver(:obj:`onmt.models.ModelSaverBase`): the saver is
+                used to save a checkpoint.
+                Thus nothing will be saved if this parameter is None
+    """
+
+    def __init__(self, alpha, temperature,
+                 model, train_loss, valid_loss, optim,
+                 trunc_size=0, shard_size=32,
+                 norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
+                 gpu_verbose_level=0, report_manager=None, model_saver=None,
+                 average_decay=0, average_every=1, model_dtype='fp32'):
+        # Basic attributes.
+        super().__init__(model, train_loss, valid_loss, optim,
+                         trunc_size, shard_size, norm_method,
+                         grad_accum_count, n_gpu, gpu_rank, gpu_verbose_level,
+                         report_manager, model_saver,
+                         average_decay, average_every, model_dtype)
+        self.alpha = alpha
+        self.temperature = temperature
+
+    def _accum_batches(self, iterator):
+        batches = []
+        normalization = 0
+        for batch in iterator:
+            batches.append(batch)
+            if self.norm_method == "tokens":
+                num_tokens = batch.tgt[1:, :, 0].ne(
+                    self.train_loss.padding_idx).sum()
+                normalization += num_tokens.item()
+            else:
+                raise ValueError('BERT KD should use tokens norm_method')
+            if len(batches) == self.grad_accum_count:
+                yield batches, normalization
+                batches = []
+                normalization = 0
+        if batches:
+            yield batches, normalization
+
+    def _gradient_accumulation(self, true_batches, normalization, total_stats,
+                               report_stats):
+        if self.grad_accum_count > 1:
+            self.optim.zero_grad()
+
+        for batch in true_batches:
+            if self.trunc_size:
+                raise ValueError('truncated BPTT not supported')
+
+            src, src_lengths = batch.src if isinstance(batch.src, tuple) \
+                else (batch.src, None)
+            if src_lengths is not None:
+                report_stats.n_src_words += src_lengths.sum().item()
+
+            # BERT knowledge distillation
+
+            # 1. F-prop all but generator.
+            if self.grad_accum_count == 1:
+                self.optim.zero_grad()
+            outputs, attns = self.model(src, batch.tgt, src_lengths,
+                                        bptt=False)
+            # mask select
+            tgt_out = batch.tgt[1:, :, 0]
+
+            # 2. Compute loss.
+            # NOTE we do not follow OpenNMT loss computation
+            loss, batch_stats = self.train_loss(
+                outputs, batch.bert_topk, tgt_out,
+                normalization,
+                self.temperature, self.alpha)
+
+            if loss is not None:
+                self.optim.backward(loss)
+
+            total_stats.update(batch_stats)
+            report_stats.update(batch_stats)
+
+            # 3. Update the parameters and statistics.
+            if self.grad_accum_count == 1:
+                # Multi GPU gradient gather
+                if self.n_gpu > 1:
+                    grads = [p.grad.data for p in self.model.parameters()
+                             if p.requires_grad
+                             and p.grad is not None]
+                    onmt.utils.distributed.all_reduce_and_rescale_tensors(
+                        grads, float(1))
+                self.optim.step()
+
+        # in case of multi step gradient accumulation,
+        # update only after accum batches
+        if self.grad_accum_count > 1:
+            if self.n_gpu > 1:
+                grads = [p.grad.data for p in self.model.parameters()
+                         if p.requires_grad
+                         and p.grad is not None]
+                onmt.utils.distributed.all_reduce_and_rescale_tensors(
+                    grads, float(1))
+            self.optim.step()
