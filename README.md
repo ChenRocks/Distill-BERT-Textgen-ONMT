@@ -1,3 +1,8 @@
+This fork of OpenNMT-py is modified to suppoprt training of this [ACL 2020 paper](https://arxiv.org/abs/1911.03829), which can be used through this [repo](https://github.com/ChenRocks/Distill-BERT-Textgen).
+The differences can be viewed by comparing the [commits](https://github.com/ChenRocks/Distill-BERT-Textgen-ONMT/compare/onmt...master).
+Note that this paper is developed from a relatively old version of OpenNMT-py, which was already the latest one at the time we started the project.
+Therefore, some new advanced features might not be supported.
+
 # OpenNMT-py: Open-Source Neural Machine Translation
 
 [![Build Status](https://travis-ci.org/OpenNMT/OpenNMT-py.svg?branch=master)](https://travis-ci.org/OpenNMT/OpenNMT-py)
